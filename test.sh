@@ -39,13 +39,16 @@ if [ -f "./prepare_$FORK.sh" ]; then
   "./prepare_$FORK.sh"
 fi
 
+mv measurements.txt measurements_orig.txt
 for sample in $(ls $INPUT); do
   echo "Validating calculate_average_$FORK.sh -- $sample"
 
   rm -f measurements.txt
-  ln -s $sample measurements.txt
+  #ln -s $sample measurements.txt
+  cp $sample measurements.txt
 
-  diff <("./calculate_average_$FORK.sh") ${sample%.txt}.out
+  diff --color=always <("./calculate_average_$FORK.sh" | ./tocsv.sh) <(./tocsv.sh < ${sample%.txt}.out)
 done
+mv measurements_orig.txt measurements.txt
 
-rm measurements.txt
+#rm measurements.txt
