@@ -44,14 +44,16 @@ import java.util.concurrent.*;
  * - One HashMap per thread: 17" locally (12" on 1BRC server)
  * - Read file in multiple threads if available and
  * - Changed String to (byte[]) Text with cache: 18" locally (but 8" -> 5" on laptop) (10" on 1BRC server)
- * - Changed Map.combine() to Map.merge(), Map.forEach() to 'for each' loop
- * - Replaced Map[Integer, Text] to IntObjectHashMap[Text]
+ * - Changed Map.combine() to Map.merge() and Map.forEach() to 'for each' loop
+ * - Replaced Map[Integer, Text] to IntObjectHashMap[Text] (5" on laptop)
  *
+ * Measure-Command { java -cp .\target\average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_japplis }
+ * 
  * @author Anthony Goubard - Japplis
  */
 public class CalculateAverage_japplis {
 
-    private static final int MAP_CAPACITY = 30_000;
+    private static final int MAP_CAPACITY = 10_000;
     private static final String DEFAULT_MEASUREMENT_FILE = "measurements.txt";
     private static final int BUFFER_SIZE = 5 * 1024 * 1024; // 5 MB
     private static final int MAX_COMPUTE_THREADS = Runtime.getRuntime().availableProcessors();
@@ -248,9 +250,15 @@ public class CalculateAverage_japplis {
 
     private int getIndexOffset(int temperature) {
         // offset is at least fractionDigitCount + 3 (digit, dot and LF)
-        if (temperature >= tenDegreesInt) return fractionDigitCount + 4;
-        if (temperature >= 0) return fractionDigitCount + 3;
-        if (temperature <= -tenDegreesInt) return fractionDigitCount + 5;
+        if (temperature >= tenDegreesInt) {
+            return fractionDigitCount + 4;
+        }
+        if (temperature >= 0) {
+            return fractionDigitCount + 3;
+        }
+        if (temperature <= -tenDegreesInt) {
+            return fractionDigitCount + 5;
+        }
         return fractionDigitCount + 4;
     }
 
@@ -323,7 +331,7 @@ public class CalculateAverage_japplis {
 
     private class ByteArray {
 
-        private byte[] array;
+        private final byte[] array;
 
         private ByteArray(int size) {
             array = new byte[size];
@@ -349,7 +357,7 @@ public class CalculateAverage_japplis {
         private static Text getByteText(byte[] buffer, int startIndex, int length, IntObjectHashMap<Text> textPool) {
             int hash = hashCode(buffer, startIndex, length);
             Text textFromPool = textPool.get(hash);
-            if (textFromPool == null || !Arrays.equals(buffer, startIndex, startIndex + length, textFromPool.textBytes, 0, length)) {
+            if (textFromPool == null || !Arrays.equals(buffer, startIndex, startIndex + length, textFromPool.textBytes, 0, textFromPool.textBytes.length)) {
                 Text newText = new Text(buffer, startIndex, length, hash);
                 textPool.put(hash, newText);
                 return newText;
