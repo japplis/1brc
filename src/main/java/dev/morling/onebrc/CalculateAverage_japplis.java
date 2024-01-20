@@ -16,6 +16,7 @@
 package dev.morling.onebrc;
 
 import java.io.*;
+import java.lang.foreign.MemorySegment;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
@@ -45,10 +46,12 @@ import java.util.concurrent.*;
  * - Read file in multiple threads if available and
  * - Changed String to (byte[]) Text with cache: 18" locally (but 8" -> 5" on laptop) (10" on 1BRC server)
  * - Changed Map.combine() to Map.merge() and Map.forEach() to 'for each' loop
- * - Replaced Map[Integer, Text] to IntObjectHashMap[Text] (5" on laptop)
+ * - Replaced Map[Integer, Text] to IntObjectHashMap[Text] (5" on laptop) (11" on 1BRC server)
+ * - Read and parsing block done in the same task
+ * - Compare byte[] using MemorySegment
  *
  * Measure-Command { java -cp .\target\average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_japplis }
- * 
+ *
  * @author Anthony Goubard - Japplis
  */
 public class CalculateAverage_japplis {
@@ -58,160 +61,165 @@ public class CalculateAverage_japplis {
     private static final int BUFFER_SIZE = 5 * 1024 * 1024; // 5 MB
     private static final int MAX_COMPUTE_THREADS = Runtime.getRuntime().availableProcessors();
 
-    private int fractionDigitCount = -1;
+    private int fractionDigitCount;
     private int tenDegreesInt;
+    private File measurementsFile;
     private long fileSize;
+    private int totalBlocks;
+
     private Map<Text, IntSummaryStatistics> cityMeasurementMap = new ConcurrentHashMap<>(MAP_CAPACITY);
-    private List<Byte> previousBlockLastLine = new ArrayList<>();
+    private Map<String, List<Byte>> splitLines = new ConcurrentHashMap<>(MAP_CAPACITY);
     private Semaphore readFileLock = new Semaphore(MAX_COMPUTE_THREADS);
     private Queue<ByteArray> bufferPool = new ConcurrentLinkedQueue<>();
+    private Queue<IntObjectHashMap<Text>> textPoolPool = new ConcurrentLinkedQueue<>();
 
-    private void parseTemperatures(File measurementsFile) throws Exception {
+    private CalculateAverage_japplis(File measurementsFile, int fractionDigitCount) {
+        this.measurementsFile = measurementsFile;
+        this.fractionDigitCount = fractionDigitCount;
+        tenDegreesInt = (int) Math.pow(10, fractionDigitCount) * 10;
         fileSize = measurementsFile.length();
+        totalBlocks = (int) (fileSize / BUFFER_SIZE) + 1;
+    }
+
+    private void parseTemperatures() throws Exception {
         int blockIndex = 0;
-        int totalBlocks = (int) (fileSize / BUFFER_SIZE) + 1;
         ExecutorService threadPool = Executors.newFixedThreadPool(MAX_COMPUTE_THREADS);
-        List<Future> parseBlockTasks = new ArrayList<>();
+        List<Future> readAndParseBlockTasks = new ArrayList<>();
 
         while (blockIndex < totalBlocks) {
-            int availableReadThreads = Math.min(readFileLock.availablePermits(), totalBlocks - blockIndex);
-            if (availableReadThreads == 0) {
-                readFileLock.acquire(); // No need to loop in the 'while' if all threads are busy
-                readFileLock.release();
-            }
-            List<Future<ByteArray>> readBlockTasks = new ArrayList<>();
-            for (int i = 0; i < availableReadThreads; i++) {
-                readFileLock.acquire(); // Wait if all threads are busy
-                Callable<ByteArray> blockReader = readBlock(measurementsFile, blockIndex);
-                Future<ByteArray> readBlockTask = threadPool.submit(blockReader);
-                readBlockTasks.add(readBlockTask);
-                blockIndex++;
-            }
-            for (Future<ByteArray> readBlockTask : readBlockTasks) {
-                ByteArray buffer = readBlockTask.get();
-                if (buffer.array().length > 0) {
-                    int startIndex = handleSplitLine(buffer.array());
-                    readFileLock.acquire(); // Wait if all threads are busy
-                    Runnable blockParser = parseTemperaturesBlock(buffer, startIndex);
-                    Future parseBlockTask = threadPool.submit(blockParser);
-                    parseBlockTasks.add(parseBlockTask);
-                }
-            }
+            readFileLock.acquire();
+            Runnable blockReaderParser = readAndParseBlock(blockIndex);
+            Future readAndParseBlockTask = threadPool.submit(blockReaderParser);
+            readAndParseBlockTasks.add(readAndParseBlockTask);
+            blockIndex++;
         }
-        for (Future parseBlockTask : parseBlockTasks) { // Wait for all tasks to finish
-            parseBlockTask.get();
+        for (Future readAndParseBlockTask : readAndParseBlockTasks) { // Wait for all tasks to finish
+            readAndParseBlockTask.get();
         }
+        parseSplitLines();
         threadPool.shutdownNow();
     }
 
-    private Callable<ByteArray> readBlock(File measurementsFile, long blockIndex) {
+    private Runnable readAndParseBlock(int blockIndex) {
         return () -> {
-            long fileIndex = blockIndex * BUFFER_SIZE;
-            if (fileIndex >= fileSize) {
-                readFileLock.release();
-                return new ByteArray(0);
-            }
-            try (InputStream measurementsFileIS = new FileInputStream(measurementsFile)) {
-                if (fileIndex > 0) {
-                    long skipped = measurementsFileIS.skip(fileIndex);
-                    while (skipped != fileIndex) {
-                        skipped += measurementsFileIS.skip(fileIndex - skipped);
-                    }
-                }
-                long bufferSize = Math.min(BUFFER_SIZE, fileSize - fileIndex);
-                ByteArray buffer = bufferSize == BUFFER_SIZE ? bufferPool.poll() : new ByteArray((int) bufferSize);
-                if (buffer == null) {
-                    buffer = new ByteArray(BUFFER_SIZE);
-                }
-                int totalRead = measurementsFileIS.read(buffer.array(), 0, (int) bufferSize);
-                while (totalRead < bufferSize) {
-                    byte[] extraBuffer = new byte[(int) (bufferSize - totalRead)];
-                    int readCount = measurementsFileIS.read(extraBuffer);
-                    System.arraycopy(extraBuffer, 0, buffer.array(), totalRead, readCount);
-                    totalRead += readCount;
-                }
-                readFileLock.release();
-                return buffer;
-            }
-        };
-    }
-
-    private Runnable parseTemperaturesBlock(ByteArray buffer, int startIndex) {
-        Runnable countAverageRun = () -> {
-            int bufferIndex = startIndex;
-            Map<Text, IntSummaryStatistics> blockCityMeasurementMap = new HashMap<>(MAP_CAPACITY);
-            IntObjectHashMap<Text> textPool = new IntObjectHashMap<>(MAP_CAPACITY);
-            byte[] bufferArray = buffer.array();
             try {
-                while (bufferIndex < bufferArray.length) {
-                    bufferIndex = readNextLine(bufferIndex, bufferArray, blockCityMeasurementMap, textPool);
-                }
+                ByteArray blockData = readBlock(blockIndex);
+                int startIndex = readSplitLines(blockData, blockIndex);
+                Map<Text, IntSummaryStatistics> blockCityMeasurementMap = parseTemperaturesBlock(blockData, startIndex);
+                mergeBlockResults(blockCityMeasurementMap);
             }
-            catch (ArrayIndexOutOfBoundsException ex) {
-                // Done reading and parsing the buffer
+            catch (Exception ex) {
             }
-            if (bufferArray.length == BUFFER_SIZE)
-                bufferPool.add(buffer);
-            mergeBlockResults(blockCityMeasurementMap);
-            readFileLock.release();
+            finally {
+                readFileLock.release();
+            }
         };
-        return countAverageRun;
     }
 
-    private int handleSplitLine(byte[] buffer) {
-        int bufferIndex = readFirstLines(buffer);
-        List<Byte> lastLine = new ArrayList<>(100); // Store the last (partial) line of the block
+    private ByteArray readBlock(long blockIndex) throws IOException {
+        long fileIndex = blockIndex * BUFFER_SIZE;
+        if (fileIndex >= fileSize) {
+            return new ByteArray(0);
+        }
+        try (InputStream measurementsFileIS = new FileInputStream(measurementsFile)) {
+            if (fileIndex > 0) {
+                long skipped = measurementsFileIS.skip(fileIndex);
+                while (skipped != fileIndex) {
+                    skipped += measurementsFileIS.skip(fileIndex - skipped);
+                }
+            }
+            long bufferSize = Math.min(BUFFER_SIZE, fileSize - fileIndex);
+            ByteArray buffer = bufferSize == BUFFER_SIZE ? bufferPool.poll() : new ByteArray((int) bufferSize);
+            if (buffer == null) {
+                buffer = new ByteArray(BUFFER_SIZE);
+            }
+            int totalRead = measurementsFileIS.read(buffer.array(), 0, (int) bufferSize);
+            while (totalRead < bufferSize) {
+                byte[] extraBuffer = new byte[(int) (bufferSize - totalRead)];
+                int readCount = measurementsFileIS.read(extraBuffer);
+                System.arraycopy(extraBuffer, 0, buffer.array(), totalRead, readCount);
+                totalRead += readCount;
+            }
+            return buffer;
+        }
+    }
+
+    private Map<Text, IntSummaryStatistics> parseTemperaturesBlock(ByteArray buffer, int startIndex) {
+        int bufferIndex = startIndex;
+        Map<Text, IntSummaryStatistics> blockCityMeasurementMap = new HashMap<>(MAP_CAPACITY);
+        IntObjectHashMap<Text> textPool = textPoolPool.poll();
+        if (textPool == null) {
+            textPool = new IntObjectHashMap<>(MAP_CAPACITY);
+        }
+        byte[] bufferArray = buffer.array();
+        try {
+            while (bufferIndex < bufferArray.length) {
+                bufferIndex = readNextLine(bufferIndex, bufferArray, blockCityMeasurementMap, textPool);
+            }
+        }
+        catch (ArrayIndexOutOfBoundsException ex) {
+            // Done reading and parsing the buffer
+        }
+        if (bufferArray.length == BUFFER_SIZE) {
+            bufferPool.add(buffer);
+            textPoolPool.add(textPool);
+        }
+        return blockCityMeasurementMap;
+    }
+
+    private int readSplitLines(ByteArray blockData, int blockIndex) {
+        byte[] buffer = blockData.array();
+        int startIndex = 0;
+        if (blockIndex < totalBlocks - 1) {
+            List<Byte> startSplitLine = readStartSplitLine(buffer); // Last line of the block
+            splitLines.put("start-" + (blockIndex + 1), startSplitLine);
+        }
+        if (blockIndex > 0) {
+            List<Byte> endSplitLine = readEndSplitLine(buffer); // First line of the block
+            splitLines.put("end-" + blockIndex, endSplitLine);
+            startIndex = endSplitLine.size();
+        }
+        return startIndex;
+    }
+
+    private List<Byte> readEndSplitLine(byte[] buffer) {
+        List<Byte> splitLine = new ArrayList<>(100);
+        int bufferIndex = 0;
+        byte car = buffer[bufferIndex++];
+        while (car != '\n') {
+            splitLine.add(car);
+            car = buffer[bufferIndex++];
+        }
+        splitLine.add((byte) '\n');
+        return splitLine;
+    }
+
+    private List<Byte> readStartSplitLine(byte[] buffer) {
+        List<Byte> splitLine = new ArrayList<>(100);
         int tailIndex = buffer.length;
         byte car = buffer[--tailIndex];
         while (car != '\n') {
-            lastLine.add(0, car);
+            splitLine.add(0, car);
             car = buffer[--tailIndex];
         }
-        if (previousBlockLastLine.isEmpty()) {
-            previousBlockLastLine = lastLine;
-            return bufferIndex;
-        }
-        bufferIndex = readSplitLine(buffer);
-        previousBlockLastLine = lastLine;
-        return bufferIndex;
+        return splitLine;
     }
 
-    private int readSplitLine(byte[] buffer) {
-        int bufferIndex = 0;
-        byte car = buffer[bufferIndex++];
-        while (car != '\n') {
-            previousBlockLastLine.add(car);
-            car = buffer[bufferIndex++];
+    private void parseSplitLines() {
+        IntObjectHashMap<Text> textPool = textPoolPool.poll();
+        if (textPool == null) {
+            textPool = new IntObjectHashMap<>(totalBlocks);
         }
-        previousBlockLastLine.add((byte) '\n');
-        byte[] splitLineBytes = new byte[previousBlockLastLine.size()];
-        for (int i = 0; i < splitLineBytes.length; i++) {
-            splitLineBytes[i] = previousBlockLastLine.get(i);
-        }
-        readNextLine(0, splitLineBytes, cityMeasurementMap, new IntObjectHashMap<>(2));
-        return bufferIndex;
-    }
-
-    private int readFirstLines(byte[] buffer) {
-        if (fractionDigitCount >= 0)
-            return 0; // not the first lines of the file
-        int bufferIndex = 0;
-        while (buffer[bufferIndex] == '#') { // read comments (like in weather_stations.csv)
-            while (buffer[bufferIndex++] != '\n') {
+        for (int i = 1; i < totalBlocks; i++) {
+            List<Byte> startSplitLine = splitLines.get("start-" + i);
+            List<Byte> endSplitLine = splitLines.get("end-" + i);
+            startSplitLine.addAll(endSplitLine);
+            byte[] splitLineBytes = new byte[startSplitLine.size()];
+            for (int j = 0; j < splitLineBytes.length; j++) {
+                splitLineBytes[i] = startSplitLine.get(i);
             }
+            readNextLine(0, splitLineBytes, cityMeasurementMap, textPool);
         }
-        int startIndex = bufferIndex;
-        int dotPos = bufferIndex;
-        byte car = buffer[bufferIndex++];
-        while (car != '\n') {
-            if (car == '.') {
-                dotPos = bufferIndex;
-            }
-            car = buffer[bufferIndex++];
-        }
-        fractionDigitCount = bufferIndex - dotPos - 1;
-        tenDegreesInt = (int) Math.pow(10, fractionDigitCount) * 10;
-        return startIndex;
     }
 
     private int readNextLine(int bufferIndex, byte[] buffer, Map<Text, IntSummaryStatistics> blockCityMeasurementMap, IntObjectHashMap<Text> textPool) {
@@ -323,9 +331,9 @@ public class CalculateAverage_japplis {
     }
 
     public static final void main(String... args) throws Exception {
-        CalculateAverage_japplis cityTemperaturesCalculator = new CalculateAverage_japplis();
         String measurementFile = args.length == 1 ? args[0] : DEFAULT_MEASUREMENT_FILE;
-        cityTemperaturesCalculator.parseTemperatures(new File(measurementFile));
+        CalculateAverage_japplis cityTemperaturesCalculator = new CalculateAverage_japplis(new File(measurementFile), 1);
+        cityTemperaturesCalculator.parseTemperatures();
         cityTemperaturesCalculator.printTemperatureStatsByCity();
     }
 
@@ -357,7 +365,7 @@ public class CalculateAverage_japplis {
         private static Text getByteText(byte[] buffer, int startIndex, int length, IntObjectHashMap<Text> textPool) {
             int hash = hashCode(buffer, startIndex, length);
             Text textFromPool = textPool.get(hash);
-            if (textFromPool == null || !Arrays.equals(buffer, startIndex, startIndex + length, textFromPool.textBytes, 0, textFromPool.textBytes.length)) {
+            if (textFromPool == null || !arrayEquals(buffer, startIndex, length, textFromPool.textBytes)) {
                 Text newText = new Text(buffer, startIndex, length, hash);
                 textPool.put(hash, newText);
                 return newText;
@@ -372,6 +380,12 @@ public class CalculateAverage_japplis {
                 hash = 31 * hash + buffer[i];
             }
             return hash;
+        }
+
+        private static boolean arrayEquals(byte[] array, int offset, int length, byte[] other) {
+            MemorySegment arraySegment = MemorySegment.ofArray(array).asSlice(offset, length);
+            MemorySegment otherSegment = MemorySegment.ofArray(other);
+            return otherSegment.mismatch(arraySegment) == 0L;
         }
 
         @Override
@@ -448,6 +462,10 @@ public class CalculateAverage_japplis {
             for (IntEntry entry : this.entries) {
                 if (entry != null) {
                     entrySet.add(entry);
+                    while (entry.next != null) {
+                        entry = entry.next;
+                        entrySet.add(entry);
+                    }
                 }
             }
             return entrySet;
