@@ -238,9 +238,9 @@ public class CalculateAverage_japplis {
             return fractionDigitCount + 3; // e.g. 1.0\n
         }
         if (temperature <= -tenDegreesInt) {
-            return fractionDigitCount + 5;  // e.g. -10.0\n
+            return fractionDigitCount + 5; // e.g. -10.0\n
         }
-        return fractionDigitCount + 4;  // e.g. -1.0\n
+        return fractionDigitCount + 4; // e.g. -1.0\n
     }
 
     private void addTemperature(ByteBuffer city, int temperature, Map<ByteBuffer, IntSummaryStatistics> blockCityMeasurementMap) {
