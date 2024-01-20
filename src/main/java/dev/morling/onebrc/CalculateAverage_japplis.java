@@ -16,7 +16,8 @@
 package dev.morling.onebrc;
 
 import java.io.*;
-import java.lang.foreign.MemorySegment;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
@@ -48,9 +49,9 @@ import java.util.concurrent.*;
  * - Changed Map.combine() to Map.merge() and Map.forEach() to 'for each' loop
  * - Replaced Map[Integer, Text] to IntObjectHashMap[Text] (5" on laptop) (11" on 1BRC server)
  * - Read and parsing block done in the same task
- * - Compare byte[] using MemorySegment
+ * - Use ByteBuffer instead of Text
  *
- * Measure-Command { java -cp .\target\average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_japplis }
+ * Measure-Command { java --enable-preview -cp .\target\average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_japplis }
  *
  * @author Anthony Goubard - Japplis
  */
@@ -67,11 +68,9 @@ public class CalculateAverage_japplis {
     private long fileSize;
     private int totalBlocks;
 
-    private Map<Text, IntSummaryStatistics> cityMeasurementMap = new ConcurrentHashMap<>(MAP_CAPACITY);
+    private Map<ByteBuffer, IntSummaryStatistics> cityMeasurementMap = new ConcurrentHashMap<>(MAP_CAPACITY);
     private Map<String, List<Byte>> splitLines = new ConcurrentHashMap<>(MAP_CAPACITY);
     private Semaphore readFileLock = new Semaphore(MAX_COMPUTE_THREADS);
-    private Queue<ByteArray> bufferPool = new ConcurrentLinkedQueue<>();
-    private Queue<IntObjectHashMap<Text>> textPoolPool = new ConcurrentLinkedQueue<>();
 
     private CalculateAverage_japplis(File measurementsFile, int fractionDigitCount) {
         this.measurementsFile = measurementsFile;
@@ -103,12 +102,13 @@ public class CalculateAverage_japplis {
     private Runnable readAndParseBlock(int blockIndex) {
         return () -> {
             try {
-                ByteArray blockData = readBlock(blockIndex);
+                ByteBuffer blockData = readBlock(blockIndex);
                 int startIndex = readSplitLines(blockData, blockIndex);
-                Map<Text, IntSummaryStatistics> blockCityMeasurementMap = parseTemperaturesBlock(blockData, startIndex);
+                Map<ByteBuffer, IntSummaryStatistics> blockCityMeasurementMap = parseTemperaturesBlock(blockData, startIndex);
                 mergeBlockResults(blockCityMeasurementMap);
             }
             catch (Exception ex) {
+                ex.printStackTrace();
             }
             finally {
                 readFileLock.release();
@@ -116,59 +116,34 @@ public class CalculateAverage_japplis {
         };
     }
 
-    private ByteArray readBlock(long blockIndex) throws IOException {
+    private ByteBuffer readBlock(long blockIndex) throws IOException {
         long fileIndex = blockIndex * BUFFER_SIZE;
         if (fileIndex >= fileSize) {
-            return new ByteArray(0);
+            return null;
         }
-        try (InputStream measurementsFileIS = new FileInputStream(measurementsFile)) {
-            if (fileIndex > 0) {
-                long skipped = measurementsFileIS.skip(fileIndex);
-                while (skipped != fileIndex) {
-                    skipped += measurementsFileIS.skip(fileIndex - skipped);
-                }
-            }
+        try (RandomAccessFile measurementsFileRAF = new RandomAccessFile(measurementsFile, "r")) {
             long bufferSize = Math.min(BUFFER_SIZE, fileSize - fileIndex);
-            ByteArray buffer = bufferSize == BUFFER_SIZE ? bufferPool.poll() : new ByteArray((int) bufferSize);
-            if (buffer == null) {
-                buffer = new ByteArray(BUFFER_SIZE);
-            }
-            int totalRead = measurementsFileIS.read(buffer.array(), 0, (int) bufferSize);
-            while (totalRead < bufferSize) {
-                byte[] extraBuffer = new byte[(int) (bufferSize - totalRead)];
-                int readCount = measurementsFileIS.read(extraBuffer);
-                System.arraycopy(extraBuffer, 0, buffer.array(), totalRead, readCount);
-                totalRead += readCount;
-            }
-            return buffer;
+            ByteBuffer mappedBuffer = measurementsFileRAF.getChannel().map(FileChannel.MapMode.READ_ONLY, fileIndex, bufferSize);
+            return mappedBuffer;
         }
     }
 
-    private Map<Text, IntSummaryStatistics> parseTemperaturesBlock(ByteArray buffer, int startIndex) {
+    private Map<ByteBuffer, IntSummaryStatistics> parseTemperaturesBlock(ByteBuffer buffer, int startIndex) {
         int bufferIndex = startIndex;
-        Map<Text, IntSummaryStatistics> blockCityMeasurementMap = new HashMap<>(MAP_CAPACITY);
-        IntObjectHashMap<Text> textPool = textPoolPool.poll();
-        if (textPool == null) {
-            textPool = new IntObjectHashMap<>(MAP_CAPACITY);
-        }
-        byte[] bufferArray = buffer.array();
+        Map<ByteBuffer, IntSummaryStatistics> blockCityMeasurementMap = new HashMap<>(MAP_CAPACITY);
         try {
-            while (bufferIndex < bufferArray.length) {
-                bufferIndex = readNextLine(bufferIndex, bufferArray, blockCityMeasurementMap, textPool);
+            while (bufferIndex < buffer.limit()) {
+                bufferIndex = readNextLine(bufferIndex, buffer, blockCityMeasurementMap);
             }
         }
-        catch (ArrayIndexOutOfBoundsException ex) {
+        catch (IndexOutOfBoundsException ex) {
             // Done reading and parsing the buffer
         }
-        if (bufferArray.length == BUFFER_SIZE) {
-            bufferPool.add(buffer);
-            textPoolPool.add(textPool);
-        }
+
         return blockCityMeasurementMap;
     }
 
-    private int readSplitLines(ByteArray blockData, int blockIndex) {
-        byte[] buffer = blockData.array();
+    private int readSplitLines(ByteBuffer buffer, int blockIndex) {
         int startIndex = 0;
         if (blockIndex < totalBlocks - 1) {
             List<Byte> startSplitLine = readStartSplitLine(buffer); // Last line of the block
@@ -182,53 +157,50 @@ public class CalculateAverage_japplis {
         return startIndex;
     }
 
-    private List<Byte> readEndSplitLine(byte[] buffer) {
+    private List<Byte> readStartSplitLine(ByteBuffer buffer) {
+        List<Byte> splitLine = new ArrayList<>(100);
+        int tailIndex = buffer.limit();
+        byte car = buffer.get(--tailIndex);
+        while (car != '\n') {
+            splitLine.add(0, car);
+            car = buffer.get(--tailIndex);
+        }
+        return splitLine;
+    }
+
+    private List<Byte> readEndSplitLine(ByteBuffer buffer) {
         List<Byte> splitLine = new ArrayList<>(100);
         int bufferIndex = 0;
-        byte car = buffer[bufferIndex++];
+        byte car = buffer.get(bufferIndex++);
         while (car != '\n') {
             splitLine.add(car);
-            car = buffer[bufferIndex++];
+            car = buffer.get(bufferIndex++);
         }
         splitLine.add((byte) '\n');
         return splitLine;
     }
 
-    private List<Byte> readStartSplitLine(byte[] buffer) {
-        List<Byte> splitLine = new ArrayList<>(100);
-        int tailIndex = buffer.length;
-        byte car = buffer[--tailIndex];
-        while (car != '\n') {
-            splitLine.add(0, car);
-            car = buffer[--tailIndex];
-        }
-        return splitLine;
-    }
-
     private void parseSplitLines() {
-        IntObjectHashMap<Text> textPool = textPoolPool.poll();
-        if (textPool == null) {
-            textPool = new IntObjectHashMap<>(totalBlocks);
-        }
         for (int i = 1; i < totalBlocks; i++) {
             List<Byte> startSplitLine = splitLines.get("start-" + i);
             List<Byte> endSplitLine = splitLines.get("end-" + i);
             startSplitLine.addAll(endSplitLine);
-            byte[] splitLineBytes = new byte[startSplitLine.size()];
-            for (int j = 0; j < splitLineBytes.length; j++) {
-                splitLineBytes[i] = startSplitLine.get(i);
+            ByteBuffer splitLineBytes = ByteBuffer.allocate(startSplitLine.size());
+            for (int j = 0; j < startSplitLine.size(); j++) {
+                splitLineBytes.put(j, (byte) startSplitLine.get(j));
             }
-            readNextLine(0, splitLineBytes, cityMeasurementMap, textPool);
+            readNextLine(0, splitLineBytes, cityMeasurementMap);
         }
     }
 
-    private int readNextLine(int bufferIndex, byte[] buffer, Map<Text, IntSummaryStatistics> blockCityMeasurementMap, IntObjectHashMap<Text> textPool) {
+    private int readNextLine(int bufferIndex, ByteBuffer buffer, Map<ByteBuffer, IntSummaryStatistics> blockCityMeasurementMap) {
         int startLineIndex = bufferIndex;
-        while (buffer[bufferIndex] != (byte) ';') {
+        bufferIndex++; // city is at least 1 character
+        while (buffer.get(bufferIndex) != (byte) ';') {
             bufferIndex++;
         }
-        // String city = new String(buffer, startLineIndex, bufferIndex - startLineIndex, StandardCharsets.UTF_8);
-        Text city = Text.getByteText(buffer, startLineIndex, bufferIndex - startLineIndex, textPool);
+        // String city = new String(cityBytes, 0, bufferIndex - startLineIndex, StandardCharsets.UTF_8);
+        ByteBuffer city = buffer.slice(startLineIndex, bufferIndex - startLineIndex);
         bufferIndex++; // skip ';'
         int temperature = readTemperature(buffer, bufferIndex);
         bufferIndex += getIndexOffset(temperature);
@@ -236,18 +208,18 @@ public class CalculateAverage_japplis {
         return bufferIndex;
     }
 
-    private int readTemperature(byte[] buffer, int bufferIndex) {
-        boolean negative = buffer[bufferIndex] == (byte) '-';
+    private int readTemperature(ByteBuffer buffer, int bufferIndex) {
+        boolean negative = buffer.get(bufferIndex) == (byte) '-';
         if (negative) {
             bufferIndex++;
         }
-        byte digit = buffer[bufferIndex++];
+        byte digit = buffer.get(bufferIndex++);
         int temperature = 0;
         while (digit != (byte) '\n') {
             temperature = temperature * 10 + (digit - (byte) '0');
-            digit = buffer[bufferIndex++];
+            digit = buffer.get(bufferIndex++);
             if (digit == (byte) '.') { // Skip '.'
-                digit = buffer[bufferIndex++];
+                digit = buffer.get(bufferIndex++);
             }
         }
         if (negative) {
@@ -270,7 +242,7 @@ public class CalculateAverage_japplis {
         return fractionDigitCount + 4;
     }
 
-    private void addTemperature(Text city, int temperature, Map<Text, IntSummaryStatistics> blockCityMeasurementMap) {
+    private void addTemperature(ByteBuffer city, int temperature, Map<ByteBuffer, IntSummaryStatistics> blockCityMeasurementMap) {
         IntSummaryStatistics measurement = blockCityMeasurementMap.get(city);
         if (measurement == null) {
             measurement = new IntSummaryStatistics();
@@ -279,8 +251,8 @@ public class CalculateAverage_japplis {
         measurement.accept(temperature);
     }
 
-    private void mergeBlockResults(Map<Text, IntSummaryStatistics> blockCityMeasurementMap) {
-        for (Map.Entry<Text, IntSummaryStatistics> cityMeasurement : blockCityMeasurementMap.entrySet()) {
+    private void mergeBlockResults(Map<ByteBuffer, IntSummaryStatistics> blockCityMeasurementMap) {
+        for (Map.Entry<ByteBuffer, IntSummaryStatistics> cityMeasurement : blockCityMeasurementMap.entrySet()) {
             cityMeasurementMap.merge(cityMeasurement.getKey(), cityMeasurement.getValue(), (m1, m2) -> {
                 m1.combine(m2);
                 return m1;
@@ -289,20 +261,29 @@ public class CalculateAverage_japplis {
     }
 
     private void printTemperatureStatsByCity() {
-        Set<Text> sortedCities = new TreeSet<>(cityMeasurementMap.keySet());
+        Map<String, IntSummaryStatistics> sortedCityMeasurement = new TreeMap<>();
+        cityMeasurementMap.forEach((city, measument) -> sortedCityMeasurement.put(toString(city), measument));
         StringBuilder result = new StringBuilder(cityMeasurementMap.size() * 40);
         result.append('{');
-        sortedCities.forEach(city -> {
-            IntSummaryStatistics measurement = cityMeasurementMap.get(city);
+        sortedCityMeasurement.forEach((city, measurement) -> {
             result.append(city);
             result.append(getTemperatureStats(measurement));
         });
-        if (!sortedCities.isEmpty()) {
+        if (!sortedCityMeasurement.isEmpty()) {
             result.delete(result.length() - 2, result.length());
         }
         result.append('}');
         String temperaturesByCity = result.toString();
         System.out.println(temperaturesByCity);
+    }
+
+    private static String toString(ByteBuffer buffer) {
+        byte[] bytes = new byte[buffer.limit()];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = buffer.get(i);
+        }
+        String text = new String(bytes, StandardCharsets.UTF_8);
+        return text;
     }
 
     private String getTemperatureStats(IntSummaryStatistics measurement) {
@@ -335,201 +316,5 @@ public class CalculateAverage_japplis {
         CalculateAverage_japplis cityTemperaturesCalculator = new CalculateAverage_japplis(new File(measurementFile), 1);
         cityTemperaturesCalculator.parseTemperatures();
         cityTemperaturesCalculator.printTemperatureStatsByCity();
-    }
-
-    private class ByteArray {
-
-        private final byte[] array;
-
-        private ByteArray(int size) {
-            array = new byte[size];
-        }
-
-        private byte[] array() {
-            return array;
-        }
-    }
-
-    private static class Text implements Comparable<Text> {
-
-        private final byte[] textBytes;
-        private final int hash;
-        private String text;
-
-        private Text(byte[] buffer, int startIndex, int length, int hash) {
-            textBytes = new byte[length];
-            this.hash = hash;
-            System.arraycopy(buffer, startIndex, textBytes, 0, length);
-        }
-
-        private static Text getByteText(byte[] buffer, int startIndex, int length, IntObjectHashMap<Text> textPool) {
-            int hash = hashCode(buffer, startIndex, length);
-            Text textFromPool = textPool.get(hash);
-            if (textFromPool == null || !arrayEquals(buffer, startIndex, length, textFromPool.textBytes)) {
-                Text newText = new Text(buffer, startIndex, length, hash);
-                textPool.put(hash, newText);
-                return newText;
-            }
-            return textFromPool;
-        }
-
-        private static int hashCode(byte[] buffer, int startIndex, int length) {
-            int hash = 31;
-            int endIndex = startIndex + length;
-            for (int i = startIndex; i < endIndex; i++) {
-                hash = 31 * hash + buffer[i];
-            }
-            return hash;
-        }
-
-        private static boolean arrayEquals(byte[] array, int offset, int length, byte[] other) {
-            MemorySegment arraySegment = MemorySegment.ofArray(array).asSlice(offset, length);
-            MemorySegment otherSegment = MemorySegment.ofArray(other);
-            return otherSegment.mismatch(arraySegment) == 0L;
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            return other != null &&
-                    hashCode() == other.hashCode() &&
-                    other instanceof Text &&
-                    Arrays.equals(textBytes, ((Text) other).textBytes);
-        }
-
-        @Override
-        public int compareTo(Text other) {
-            return toString().compareTo(other.toString());
-        }
-
-        @Override
-        public String toString() {
-            if (text == null) {
-                text = new String(textBytes, StandardCharsets.UTF_8);
-            }
-            return text;
-        }
-    }
-
-    // inspiration from https://javaexplorer03.blogspot.com/2015/10/create-own-hashmap.html
-    private static class IntObjectHashMap<V> extends AbstractMap<Integer, V> {
-        private static class IntEntry<V> implements Map.Entry<Integer, V> {
-            private int key;
-            private V value;
-            private IntEntry next;
-
-            private IntEntry(int key, V value) {
-                this.key = key;
-                this.value = value;
-            }
-
-            public int getIntKey() {
-                return key;
-            }
-
-            @Override
-            public Integer getKey() {
-                return key;
-            }
-
-            @Override
-            public V getValue() {
-                return value;
-            }
-
-            @Override
-            public V setValue(V value) {
-                V oldValue = this.value;
-                this.value = value;
-                return oldValue;
-            }
-        }
-
-        private IntEntry<V>[] entries;
-        private int size;
-
-        public IntObjectHashMap(int capacity) {
-            entries = new IntEntry[capacity];
-        }
-
-        @Override
-        public Set<Map.Entry<Integer, V>> entrySet() {
-            Set<Map.Entry<Integer, V>> entrySet = new HashSet<>(entries.length);
-            for (IntEntry entry : this.entries) {
-                if (entry != null) {
-                    entrySet.add(entry);
-                    while (entry.next != null) {
-                        entry = entry.next;
-                        entrySet.add(entry);
-                    }
-                }
-            }
-            return entrySet;
-        }
-
-        public V put(int key, V value) {
-            int location = key < 0 ? (-key % entries.length) : (key % entries.length);
-            IntEntry<V> entry = entries[location];
-            if (entry == null) {
-                entries[location] = new IntEntry<>(key, value);
-                size++;
-                return null;
-            }
-            while (entry.next != null && entry.key != key) {
-                entry = entry.next;
-            }
-            if (entry.key == key) {
-                V oldValue = entry.setValue(value);
-                return oldValue;
-            }
-            entry.next = new IntEntry<>(key, value);
-            size++;
-            return null;
-        }
-
-        public V get(int key) {
-            int location = key < 0 ? (-key % entries.length) : (key % entries.length);
-            IntEntry<V> entry = entries[location];
-            if (entry == null) {
-                return null;
-            }
-            while (entry.next != null && entry.key != key) {
-                entry = entry.next;
-            }
-            if (entry.key == key) {
-                return entry.getValue();
-            }
-            return null;
-        }
-
-        @Override
-        public V put(Integer key, V value) {
-            return put(key.intValue(), value);
-        }
-
-        @Override
-        public V get(Object key) {
-            return get(((Integer) key).intValue());
-        }
-
-        @Override
-        public void clear() {
-            entries = new IntEntry[entries.length];
-            size = 0;
-        }
-
-        @Override
-        public int size() {
-            return size;
-        }
-
-        @Override
-        public V remove(Object key) {
-            throw new UnsupportedOperationException("Removing item is not supported");
-        }
     }
 }
