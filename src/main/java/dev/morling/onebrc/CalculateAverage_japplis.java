@@ -49,9 +49,10 @@ import java.util.concurrent.*;
  * - Changed Map.combine() to Map.merge() and Map.forEach() to 'for each' loop
  * - Replaced Map[Integer, Text] to IntObjectHashMap[Text] (5" on laptop) (11" on 1BRC server)
  * - Read and parsing block done in the same task
- * - Use ByteBuffer instead of Text
+ * - Use RandomAccessFile instead of FileInputStream
+ * - Use ByteBuffer instead of Text (7" on laptop)
  *
- * Measure-Command { java --enable-preview -cp .\target\average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_japplis }
+ * Measure-Command { java -cp .\target\average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_japplis }
  *
  * @author Anthony Goubard - Japplis
  */
@@ -231,15 +232,15 @@ public class CalculateAverage_japplis {
     private int getIndexOffset(int temperature) {
         // offset is at least fractionDigitCount + 3 (digit, dot and LF)
         if (temperature >= tenDegreesInt) {
-            return fractionDigitCount + 4;
+            return fractionDigitCount + 4; // e.g. 10.0\n
         }
         if (temperature >= 0) {
-            return fractionDigitCount + 3;
+            return fractionDigitCount + 3; // e.g. 1.0\n
         }
         if (temperature <= -tenDegreesInt) {
-            return fractionDigitCount + 5;
+            return fractionDigitCount + 5;  // e.g. -10.0\n
         }
-        return fractionDigitCount + 4;
+        return fractionDigitCount + 4;  // e.g. -1.0\n
     }
 
     private void addTemperature(ByteBuffer city, int temperature, Map<ByteBuffer, IntSummaryStatistics> blockCityMeasurementMap) {
